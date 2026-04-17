@@ -1,0 +1,12 @@
+clip_id,gpu,model,coc,num_cams,num_frames,diff_steps,config,optimizations,gpu_inf_ms,hz,ade_m,n_preds
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,A100-40GB,Alpamayo-R1-10B,no,4,4,10,4cam_4fr_10diff,baseline,1040.1,1.00,1.52,18
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,A100-40GB,Alpamayo-R1-10B,no,1,1,1,1cam_1fr_1diff,baseline,192.4,5.22,4.56,94
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,A100-40GB,Alpamayo-R1-10B,yes,4,4,10,4cam_4fr_10diff,baseline,1557.3,0.67,2.01,12
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,A100-40GB,Alpamayo-R1-10B,yes,1,1,1,1cam_1fr_1diff,baseline,792.0,1.28,4.44,23
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,H100,Alpamayo-R1-10B,no,4,4,10,4cam_4fr_10diff,baseline,405.4,2.50,1.56,45
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,H100,Alpamayo-R1-10B,no,1,1,1,1cam_1fr_1diff,baseline,85.3,11.72,4.62,211
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,H100,Alpamayo-1.5-10B,no,4,4,10,4cam_4fr_10diff,baseline,457.6,2.22,1.22,40
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,H100,Alpamayo-1.5-10B,no,1,1,1,1cam_1fr_1diff,baseline,92.1,10.89,7.72,196
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,H100,Alpamayo-1.5-10B,no,1,1,1,1cam_1fr_1diff,num_frames_per_camera_fix,93.0,10.78,7.73,194
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,H100,Alpamayo-1.5-10B,no,1,4,4,1cam_4fr_4diff,num_frames_per_camera_fix,182.1,5.50,2.88,99
+25cd4769-5dcf-4b53-a351-bf2c5deb6124,H100,Alpamayo-1.5-10B,no,1,4,10,1cam_4fr_10diff,num_frames_per_camera_fix,337.8,3.00,3.18,54
