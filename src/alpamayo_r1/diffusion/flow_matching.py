@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 from alpamayo_r1.diffusion.base import BaseDiffusion, StepFn
@@ -31,7 +31,7 @@ class FlowMatching(BaseDiffusion):
 
     def __init__(
         self,
-        int_method: Literal["euler"] = "euler",
+        int_method: str = "euler",
         train_timestep_sampler: Literal["uniform", "beta"] = "beta",
         num_inference_steps: int = 10,
         train_ignore_guidance_rate: float = 0.1,
@@ -65,7 +65,7 @@ class FlowMatching(BaseDiffusion):
         device: torch.device = torch.device("cpu"),
         return_all_steps: bool = False,
         inference_step: int | None = None,
-        int_method: Literal["euler"] | None = None,
+        int_method: str | None = None,
         *args,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -94,8 +94,135 @@ class FlowMatching(BaseDiffusion):
                 return_all_steps=return_all_steps,
                 inference_step=inference_step,
             )
+        elif int_method in ("heun", "rk2"):
+            return self._heun(
+                batch_size=batch_size,
+                step_fn=step_fn,
+                device=device,
+                return_all_steps=return_all_steps,
+                inference_step=inference_step,
+            )
+        elif int_method in ("midpoint", "rk2_mid"):
+            return self._midpoint(
+                batch_size=batch_size,
+                step_fn=step_fn,
+                device=device,
+                return_all_steps=return_all_steps,
+                inference_step=inference_step,
+            )
+        elif int_method in ("dpm2m", "ab2"):
+            return self._ab2(
+                batch_size=batch_size,
+                step_fn=step_fn,
+                device=device,
+                return_all_steps=return_all_steps,
+                inference_step=inference_step,
+            )
         else:
             raise ValueError(f"Invalid integration method: {int_method}")
+
+    def _heun(
+        self,
+        batch_size: int,
+        step_fn: StepFn,
+        device: torch.device = torch.device("cpu"),
+        return_all_steps: bool = False,
+        inference_step: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Heun (RK2 trapezoidal) integration for flow matching.
+
+        Each step: v1 = f(x,t); x_euler = x + dt*v1; v2 = f(x_euler, t+dt);
+        x_new = x + 0.5*dt*(v1+v2). Cost: 2 NFE per step, so N=5 Heun ≈ 10 NFE.
+        """
+        x = torch.randn(batch_size, *self.x_dims, device=device)
+        time_steps = torch.linspace(0.0, 1.0, inference_step + 1, device=device)
+        n_dim = len(self.x_dims)
+        if return_all_steps:
+            all_steps = [x]
+        for i in range(inference_step):
+            dt = time_steps[i + 1] - time_steps[i]
+            dt_b = dt.view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            t0 = time_steps[i].view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            t1 = time_steps[i + 1].view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            v1 = step_fn(x=x, t=t0)
+            x_euler = x + dt_b * v1
+            v2 = step_fn(x=x_euler, t=t1)
+            x = x + 0.5 * dt_b * (v1 + v2)
+            if return_all_steps:
+                all_steps.append(x)
+        if return_all_steps:
+            return torch.stack(all_steps, dim=1), time_steps
+        return x
+
+    def _midpoint(
+        self,
+        batch_size: int,
+        step_fn: StepFn,
+        device: torch.device = torch.device("cpu"),
+        return_all_steps: bool = False,
+        inference_step: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Explicit midpoint (RK2) integration. 2 NFE/step."""
+        x = torch.randn(batch_size, *self.x_dims, device=device)
+        time_steps = torch.linspace(0.0, 1.0, inference_step + 1, device=device)
+        n_dim = len(self.x_dims)
+        if return_all_steps:
+            all_steps = [x]
+        for i in range(inference_step):
+            dt = time_steps[i + 1] - time_steps[i]
+            dt_b = dt.view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            t0 = time_steps[i].view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            t_mid = (time_steps[i] + 0.5 * dt).view(1, *[1] * n_dim).expand(
+                batch_size, *[1] * n_dim
+            )
+            v1 = step_fn(x=x, t=t0)
+            x_mid = x + 0.5 * dt_b * v1
+            v_mid = step_fn(x=x_mid, t=t_mid)
+            x = x + dt_b * v_mid
+            if return_all_steps:
+                all_steps.append(x)
+        if return_all_steps:
+            return torch.stack(all_steps, dim=1), time_steps
+        return x
+
+    def _ab2(
+        self,
+        batch_size: int,
+        step_fn: StepFn,
+        device: torch.device = torch.device("cpu"),
+        return_all_steps: bool = False,
+        inference_step: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Adams-Bashforth 2-step multistep (DPM-Solver++ 2M style: 1 NFE/step).
+
+        Reuses previous-step velocity: x_{i+1} = x_i + dt*(1.5*v_i - 0.5*v_{i-1}).
+        First step is plain Euler. Same total NFE as Euler but 2nd-order accuracy
+        on smooth vector fields — this is the flow-matching analogue of DPM++ 2M.
+        """
+        x = torch.randn(batch_size, *self.x_dims, device=device)
+        time_steps = torch.linspace(0.0, 1.0, inference_step + 1, device=device)
+        n_dim = len(self.x_dims)
+        if return_all_steps:
+            all_steps = [x]
+        v_prev = None
+        dt_prev = None
+        for i in range(inference_step):
+            dt = time_steps[i + 1] - time_steps[i]
+            dt_b = dt.view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            t0 = time_steps[i].view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            v = step_fn(x=x, t=t0)
+            if v_prev is None:
+                x = x + dt_b * v
+            else:
+                # AB2 with constant step (dt==dt_prev here since linspace)
+                x = x + dt_b * (1.5 * v - 0.5 * v_prev)
+            v_prev = v
+            dt_prev = dt_b
+            if return_all_steps:
+                all_steps.append(x)
+        if return_all_steps:
+            return torch.stack(all_steps, dim=1), time_steps
+        return x
 
     def _euler(
         self,
