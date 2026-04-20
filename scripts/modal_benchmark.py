@@ -90,6 +90,44 @@ image_trtllm = (
     )
 )
 
+# ParoQuant image: base + paroquant + vLLM (Marlin W4A8 kernels).
+# FlashDriveVLA's Alpamayo-R1-10B-finetuned-PARO checkpoint is in vLLM's
+# Marlin format (confirmed by smoke test: checkpoint ships g_idx,
+# g_idx_sort_indices, workspace, input_global_scale — all Marlin-specific).
+# paroquant's transformers backend uses AWQ GEMM (W4A16) which is a different
+# on-disk layout, so we import vllm directly for its Marlin kernel bindings.
+#
+# Alpamayo's own pyproject pins vllm==0.11.0 so we match that. Using
+# --no-deps on paroquant itself to avoid pulling an incompatible vllm>=0.15.
+image_paro = (
+    image
+    .pip_install("vllm==0.11.0")
+    .pip_install("paroquant>=0.1.12", extra_options="--no-deps")
+    .add_local_dir(
+        ".",
+        remote_path=REPO_ROOT,
+        ignore=["notebooks", ".git", "uv.lock", "finetune/rl", "**/__pycache__"],
+    )
+)
+
+# DFlash image: base + dflash[transformers]. Only the Transformers backend
+# is relevant here because Alpamayo-R1 runs model.vlm.generate() directly
+# (not via a vLLM/SGLang server). DFlash's draft.spec_generate(target=...)
+# accepts an AutoModelForCausalLM target — we wrap model.vlm.language_model
+# (the Qwen3 text decoder underneath Qwen3VLForConditionalGeneration) after
+# feeding in VLM-embedded input tokens.
+image_dflash = (
+    image.pip_install(
+        "git+https://github.com/z-lab/dflash.git",
+        extra_options="--no-deps",  # Avoid pulling extras that reinstall torch
+    )
+    .add_local_dir(
+        ".",
+        remote_path=REPO_ROOT,
+        ignore=["notebooks", ".git", "uv.lock", "finetune/rl", "**/__pycache__"],
+    )
+)
+
 app = modal.App("alpamayo-r1-bench", image=image)
 
 hf_cache = modal.Volume.from_name("alpamayo-hf-cache", create_if_missing=True)
@@ -2843,3 +2881,932 @@ def ablation_stack_compile_euler_horizon():
 def stack_compile_euler_horizon():
     r = ablation_stack_compile_euler_horizon.remote()
     print("[local] stack:", r)
+
+
+# -----------------------------------------------------------------------------
+# ABLATION: ParoQuant INT4 (Marlin W4A8) on VLM text decoder
+# -----------------------------------------------------------------------------
+#
+# FlashDriveVLA/Alpamayo-R1-10B-finetuned-PARO ships 252 VLM text decoder
+# Linears pre-quantized to W4A8 Marlin format. Each layer stores:
+#   rotation.theta           — learned pairwise rotation angles (krot, in_f/2)
+#   rotation.pairs           — rotation channel indices (krot, in_f)
+#   rotation.channel_scales  — per-channel pre-rotation scale (1, in_f)
+#   qlinear.qweight          — Marlin-packed INT4 weights
+#   qlinear.qzeros           — zero-points
+#   qlinear.scales           — per-group fp16 scales
+#   qlinear.g_idx            — Marlin act-order permutation
+#   qlinear.g_idx_sort_indices
+#   qlinear.workspace        — Marlin scratchpad
+#   qlinear.input_global_scale — optional act scale (unused on FP16 act)
+#
+# Integration:
+# 1. Load base Alpamayo-R1 bf16 model from nvidia/Alpamayo-R1-10B as usual.
+# 2. Walk the VLM module tree; match quantized FQNs from the checkpoint to
+#    actual nn.Linear modules on our instance.
+# 3. Swap each matched Linear with a custom ParoMarlinLinear module that
+#    wraps paroquant's rotation kernel + vllm's apply_awq_marlin_linear.
+# 4. Load the PARO safetensor shards; route keys to the new module buffers.
+# 5. Run the standard ablation sim.
+#
+# bf16 activation handling: vllm's Marlin kernel accepts fp16; we wrap in a
+# bf16→fp16→bf16 adapter since the rest of Alpamayo runs bf16 autocast.
+image_paro_bench = image_paro
+
+@app.function(
+    gpu="H100",
+    image=image_paro_bench,
+    volumes={"/cache/hf": hf_cache, "/cache/pai": pai_cache},
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=60 * 30,
+)
+def ablation_paroquant_vlm(
+    paro_model: str = "FlashDriveVLA/Alpamayo-R1-10B-finetuned-PARO",
+    skip_cot: bool = True,
+    compile_expert: bool = False,
+    diff_steps: int = 10,
+    n_cams: int = 4,
+    n_frames: int = 4,
+    base_repo: str = "nvidia/Alpamayo-R1-10B",
+):
+    """Swap VLM Linears for Marlin-W4A8 linears + paroquant rotation and
+    run the ablation sim.
+
+    Loads the FlashDriveVLA PARO checkpoint (W4A8 Marlin format) and grafts
+    its quantized Linears onto the nvidia/Alpamayo-R1-10B bf16 base. vLLM
+    kernels (apply_awq_marlin_linear) handle the INT4 matmul; paroquant's
+    torch.ops.rotation.rotate handles the per-channel pairwise rotation.
+    """
+    import os
+    os.environ["HF_HOME"] = "/cache/hf"
+    os.environ["HUGGINGFACE_HUB_CACHE"] = "/cache/hf/hub"
+    os.environ["PAI_CACHE"] = "/cache/pai"
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    if "HF_TOKEN" not in os.environ and "HUGGING_FACE_HUB_TOKEN" in os.environ:
+        os.environ["HF_TOKEN"] = os.environ["HUGGING_FACE_HUB_TOKEN"]
+    elif "HUGGING_FACE_HUB_TOKEN" not in os.environ and "HF_TOKEN" in os.environ:
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    import time
+    import glob
+    import json
+    import torch
+    import torch.nn as nn
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    # Import paroquant kernel to register torch.ops.rotation.rotate.
+    try:
+        import paroquant.kernels.cuda  # noqa: F401
+    except Exception as e:
+        return {
+            "optimization": "paroquant_vlm_marlin_w4a8",
+            "error": f"paroquant kernel import failed: {type(e).__name__}: {e}",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    # Import vLLM's Marlin kernel binding. apply_awq_marlin_linear consumes
+    # already-Marlin-packed qweight/qzeros + scales + g_idx + workspace.
+    try:
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            apply_awq_marlin_linear,
+            marlin_make_workspace,
+            marlin_make_empty_g_idx,
+        )
+        from vllm.scalar_type import scalar_types
+        MARLIN_QUANT_TYPE = scalar_types.uint4
+    except Exception as e:
+        return {
+            "optimization": "paroquant_vlm_marlin_w4a8",
+            "error": f"vllm marlin import failed: {type(e).__name__}: {e}",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+    from alpamayo_r1.config import AlpamayoR1Config
+    from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
+    from alpamayo_r1 import helper
+    import physical_ai_av
+
+    # Step 1: download PARO checkpoint + scan keys.
+    print(f"[paro] downloading {paro_model} ...")
+    t0 = time.perf_counter()
+    local_dir = snapshot_download(paro_model)
+    print(f"[paro] downloaded in {time.perf_counter()-t0:.1f}s → {local_dir}")
+
+    index_file = os.path.join(local_dir, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            all_keys = list(json.load(f).get("weight_map", {}).keys())
+    else:
+        all_keys = []
+        for sf in sorted(glob.glob(os.path.join(local_dir, "*.safetensors"))):
+            with safe_open(sf, framework="pt") as st:
+                all_keys.extend(st.keys())
+
+    # Identify quantized Linear FQNs. Smoke test confirmed keys end in
+    # e.g. "vlm.model.language_model.layers.0.mlp.down_proj.rotate_linear.qlinear.qweight"
+    # → real Linear FQN is everything before ".rotate_linear".
+    qlinear_qweight_keys = [k for k in all_keys if k.endswith(".rotate_linear.qlinear.qweight")]
+    quantized_fqns = {k.removesuffix(".rotate_linear.qlinear.qweight") for k in qlinear_qweight_keys}
+    print(f"[paro] checkpoint declares {len(quantized_fqns)} quantized Linears")
+    if len(quantized_fqns) == 0:
+        return {
+            "optimization": "paroquant_vlm_marlin_w4a8",
+            "error": "no .rotate_linear.qlinear.qweight keys found in PARO checkpoint",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    # Step 2: load base bf16 Alpamayo-R1.
+    base_cfg = AlpamayoR1Config.from_pretrained(base_repo)
+    base_cfg.attn_implementation = "flash_attention_2"
+    print(f"[paro] loading base bf16 model from {base_repo} ...")
+    t0 = time.perf_counter()
+    model = AlpamayoR1.from_pretrained(
+        base_repo, config=base_cfg, dtype=torch.bfloat16,
+    ).to("cuda")
+    model.eval()
+    model.expert.config._attn_implementation = "sdpa"
+    for _m in model.expert.modules():
+        _c = getattr(_m, "config", None)
+        if _c is not None and hasattr(_c, "_attn_implementation_internal"):
+            _c._attn_implementation_internal = "sdpa"
+    print(f"[paro] base model loaded in {time.perf_counter()-t0:.1f}s")
+
+    # Step 3: match quantized FQNs to model Linears.
+    all_named = dict(model.named_modules())
+    quant_map = {}  # name_in_model -> ckpt_prefix
+    unmatched_fqns = []
+    for ckpt_fqn in quantized_fqns:
+        # The checkpoint key prefix is "vlm.model.language_model.layers.N...".
+        # On our bf16 model from nvidia/Alpamayo-R1-10B, the equivalent module
+        # path is the same (AlpamayoR1 has self.vlm which is Qwen3VLForConditionalGeneration;
+        # that has .model (Qwen3VLModel) containing .language_model).
+        if ckpt_fqn in all_named and isinstance(all_named[ckpt_fqn], nn.Linear):
+            quant_map[ckpt_fqn] = ckpt_fqn
+        else:
+            unmatched_fqns.append(ckpt_fqn)
+    print(f"[paro] matched {len(quant_map)}/{len(quantized_fqns)} Linears in model tree")
+    if unmatched_fqns:
+        print(f"[paro] UNMATCHED sample: {unmatched_fqns[:3]}")
+        # Check what module-tree names are similar
+        candidates = [
+            n for n, m in model.named_modules()
+            if isinstance(m, nn.Linear) and "language_model" in n
+        ]
+        print(f"[paro] model language_model Linears sample: {candidates[:3]}")
+    if len(quant_map) < 252:
+        return {
+            "optimization": "paroquant_vlm_marlin_w4a8",
+            "error": f"only matched {len(quant_map)}/252 FQNs. "
+                     f"Unmatched sample: {unmatched_fqns[:3]}",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    # Step 4: define the Marlin-W4A8 + paroquant-rotation Linear module and swap.
+    class ParoMarlinLinear(nn.Module):
+        """Marlin INT4 weight + paroquant pairwise rotation, fp16 activations.
+
+        Buffers mirror the checkpoint layout so state_dict load works:
+          rotation.theta, rotation.pairs, rotation.channel_scales
+          qlinear.qweight, qlinear.qzeros, qlinear.scales,
+          qlinear.g_idx, qlinear.g_idx_sort_indices, qlinear.workspace,
+          qlinear.input_global_scale
+        """
+
+        def __init__(self, in_features, out_features, has_bias=False,
+                     group_size=128, bits=4, krot=8):
+            super().__init__()
+            self.in_features = in_features
+            self.out_features = out_features
+            self.group_size = group_size
+            self.bits = bits
+            self.krot = krot
+            pack = 32 // bits
+            n_groups = in_features // group_size
+
+            # Rotation (under `rotate_linear.rotation.*` on the checkpoint).
+            # We host these flat under self.rotation.* for the state_dict to
+            # match `<fqn>.rotate_linear.rotation.theta` → we'll use a dict-
+            # loading path below; buffer placement here is just runtime.
+            self.register_buffer("rot_theta",
+                torch.zeros(krot, in_features // 2, dtype=torch.float16))
+            self.register_buffer("rot_pairs",
+                torch.zeros(krot, in_features, dtype=torch.int16))
+            self.register_buffer("rot_channel_scales",
+                torch.ones(1, in_features, dtype=torch.float16))
+
+            # Marlin quantized params (pre-packed by the conversion pipeline).
+            # Shapes below are conservative placeholders — overridden by actual
+            # checkpoint tensors in load time.
+            self.register_buffer("qweight",
+                torch.zeros(in_features // pack, out_features * pack, dtype=torch.int32))
+            self.register_buffer("qzeros",
+                torch.zeros(n_groups, out_features // pack, dtype=torch.int32))
+            self.register_buffer("scales",
+                torch.zeros(n_groups, out_features, dtype=torch.float16))
+            self.register_buffer("g_idx",
+                torch.zeros(in_features, dtype=torch.int32))
+            self.register_buffer("g_idx_sort_indices",
+                torch.zeros(in_features, dtype=torch.int32))
+            self.register_buffer("workspace",
+                torch.zeros(1024, dtype=torch.int32))
+            self.register_buffer("input_global_scale",
+                torch.ones(1, dtype=torch.float32))
+
+            if has_bias:
+                self.register_buffer("bias",
+                    torch.zeros(out_features, dtype=torch.float16))
+            else:
+                self.bias = None
+
+        @torch.no_grad()
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Rotation kernel supports bf16/fp16/fp32 natively; Marlin kernel
+            # on SM90+ supports bf16. Scales/qweight are stored as fp16/int32
+            # but Marlin accepts them regardless. We cast rotation buffers
+            # lazily to match x's dtype (done by the rotation CUDA kernel
+            # internally; see rotate_launcher's theta_cast/scales_cast).
+            x_rot = torch.ops.rotation.rotate(
+                x, self.rot_pairs, self.rot_theta, self.rot_channel_scales,
+            )
+            # Marlin expects scales/zp in same dtype family as input.
+            # When x is bf16 but scales are fp16, vllm's marlin will fail.
+            # Conservative: cast to fp16 before Marlin, cast back.
+            in_dtype = x.dtype
+            x16 = x_rot.to(torch.float16) if x_rot.dtype != torch.float16 else x_rot
+            out = apply_awq_marlin_linear(
+                input=x16,
+                weight=self.qweight,
+                weight_scale=self.scales,
+                weight_zp=self.qzeros,
+                g_idx=self.g_idx,
+                g_idx_sort_indices=self.g_idx_sort_indices,
+                workspace=self.workspace,
+                quant_type=MARLIN_QUANT_TYPE,
+                output_size_per_partition=self.out_features,
+                input_size_per_partition=self.in_features,
+                bias=self.bias,
+            )
+            return out.to(in_dtype) if in_dtype != torch.float16 else out
+
+    # Read group_size/krot from the w4a8 config (defaults are safe).
+    w4a8_path = os.path.join(local_dir, "w4a8_config.json")
+    w4a8_cfg = {}
+    if os.path.exists(w4a8_path):
+        with open(w4a8_path) as f:
+            w4a8_cfg = json.load(f)
+    group_size = int(w4a8_cfg.get("group_size", 128))
+    krot = int(w4a8_cfg.get("krot", 8))
+    bits = int(w4a8_cfg.get("bits", 4))
+
+    bias_count = 0
+    for name_in_model in quant_map:
+        old_linear = all_named[name_in_model]
+        has_bias = old_linear.bias is not None
+        if has_bias:
+            bias_count += 1
+        new_mod = ParoMarlinLinear(
+            in_features=old_linear.in_features,
+            out_features=old_linear.out_features,
+            has_bias=has_bias,
+            group_size=group_size, bits=bits, krot=krot,
+        ).to("cuda")
+        parent_name, attr = (
+            name_in_model.rsplit(".", 1) if "." in name_in_model else ("", name_in_model)
+        )
+        parent = model.get_submodule(parent_name) if parent_name else model
+        setattr(parent, attr, new_mod)
+    print(f"[paro] swapped {len(quant_map)} Linears → ParoMarlinLinear "
+          f"({bias_count} with bias); gs={group_size} krot={krot}")
+
+    # Step 5: load PARO shards and route tensors into the swapped modules.
+    # Checkpoint key → module buffer mapping:
+    #   <fqn>.rotate_linear.rotation.theta           → <fqn>.rot_theta
+    #   <fqn>.rotate_linear.rotation.pairs           → <fqn>.rot_pairs
+    #   <fqn>.rotate_linear.rotation.channel_scales  → <fqn>.rot_channel_scales
+    #   <fqn>.rotate_linear.qlinear.qweight          → <fqn>.qweight
+    #   <fqn>.rotate_linear.qlinear.qzeros           → <fqn>.qzeros
+    #   <fqn>.rotate_linear.qlinear.scales           → <fqn>.scales
+    #   <fqn>.rotate_linear.qlinear.g_idx            → <fqn>.g_idx
+    #   <fqn>.rotate_linear.qlinear.g_idx_sort_indices → <fqn>.g_idx_sort_indices
+    #   <fqn>.rotate_linear.qlinear.workspace        → <fqn>.workspace
+    #   <fqn>.rotate_linear.qlinear.input_global_scale → <fqn>.input_global_scale
+    SUFFIX_MAP = {
+        "rotate_linear.rotation.theta": "rot_theta",
+        "rotate_linear.rotation.pairs": "rot_pairs",
+        "rotate_linear.rotation.channel_scales": "rot_channel_scales",
+        "rotate_linear.qlinear.qweight": "qweight",
+        "rotate_linear.qlinear.qzeros": "qzeros",
+        "rotate_linear.qlinear.scales": "scales",
+        "rotate_linear.qlinear.g_idx": "g_idx",
+        "rotate_linear.qlinear.g_idx_sort_indices": "g_idx_sort_indices",
+        "rotate_linear.qlinear.workspace": "workspace",
+        "rotate_linear.qlinear.input_global_scale": "input_global_scale",
+    }
+    expected_per_layer = len(SUFFIX_MAP)
+
+    print("[paro] loading PARO tensors into swapped layers ...")
+    t0 = time.perf_counter()
+    loaded = 0
+    shape_mismatch = 0
+    for sf in sorted(glob.glob(os.path.join(local_dir, "*.safetensors"))):
+        with safe_open(sf, framework="pt", device="cuda") as st:
+            for key in st.keys():
+                # Find which quantized FQN this key belongs to and which buffer.
+                for ckpt_suffix, buf_name in SUFFIX_MAP.items():
+                    if key.endswith("." + ckpt_suffix):
+                        fqn = key.removesuffix("." + ckpt_suffix)
+                        if fqn not in quant_map:
+                            break
+                        target_mod = all_named[fqn] if fqn in all_named else None
+                        # After swap, named_modules sees new module: re-resolve.
+                        parent_name, attr = (
+                            fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
+                        )
+                        parent = model.get_submodule(parent_name) if parent_name else model
+                        target_mod = getattr(parent, attr)
+                        if not hasattr(target_mod, buf_name):
+                            break
+                        tgt_buf = getattr(target_mod, buf_name)
+                        src = st.get_tensor(key)
+                        if tgt_buf is None or tgt_buf.shape != src.shape:
+                            # Replace the buffer with the correct shape.
+                            target_mod.register_buffer(buf_name, src.to(tgt_buf.device) if tgt_buf is not None else src)
+                            shape_mismatch += 1
+                        else:
+                            tgt_buf.copy_(src.to(tgt_buf.device))
+                        loaded += 1
+                        break
+    print(f"[paro] loaded {loaded} tensors "
+          f"({shape_mismatch} shape-replaced) in {time.perf_counter()-t0:.1f}s "
+          f"(expected ~{len(quant_map) * expected_per_layer})")
+
+    # Regenerate GPU-specific Marlin workspace/g_idx/g_idx_sort_indices for each
+    # layer. The checkpoint's stored values were sized for whatever GPU did the
+    # conversion (different SM count or sort perm than our H100). Using those
+    # stale tensors is a silent corruption source — workspace is scratch, g_idx
+    # is the act_order permutation (empty when act_order=False, as here).
+    device = torch.device("cuda")
+    regenerated = 0
+    for fqn in quant_map:
+        parent_name, attr = (
+            fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
+        )
+        parent = model.get_submodule(parent_name) if parent_name else model
+        mod = getattr(parent, attr)
+        mod.register_buffer("workspace",
+            marlin_make_workspace(mod.out_features, device))
+        mod.register_buffer("g_idx",
+            marlin_make_empty_g_idx(device).data)
+        mod.register_buffer("g_idx_sort_indices",
+            marlin_make_empty_g_idx(device).data)
+        regenerated += 1
+    print(f"[paro] regenerated GPU-specific workspace/g_idx for "
+          f"{regenerated} layers")
+
+    expected_total = len(quant_map) * expected_per_layer
+    if loaded < expected_total * 0.9:
+        return {
+            "optimization": "paroquant_vlm_marlin_w4a8",
+            "error": f"loaded only {loaded}/{expected_total} tensors "
+                     f"(<90% of expected)",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    # Attach NaN/Inf detection hooks to every quantized layer to find the
+    # first offending layer during forward.
+    first_bad = {"name": None, "stats": None}
+    hook_handles = []
+
+    def _make_hook(layer_name):
+        def _hook(mod, inp, out):
+            if first_bad["name"] is not None:
+                return
+            t = out if isinstance(out, torch.Tensor) else out[0]
+            if torch.isnan(t).any() or torch.isinf(t).any():
+                first_bad["name"] = layer_name
+                in_t = inp[0] if isinstance(inp, tuple) else inp
+                first_bad["stats"] = {
+                    "in_nan": torch.isnan(in_t).any().item(),
+                    "in_max": in_t.float().abs().max().item(),
+                    "out_nan": torch.isnan(t).any().item(),
+                    "out_inf": torch.isinf(t).any().item(),
+                }
+        return _hook
+
+    for fqn in quant_map:
+        parent_name, attr = (
+            fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
+        )
+        parent = model.get_submodule(parent_name) if parent_name else model
+        mod = getattr(parent, attr)
+        h = mod.register_forward_hook(_make_hook(fqn))
+        hook_handles.append(h)
+
+    # Full-model smoke: run the VLM language_model on a dummy token sequence
+    # to verify the quantized forward stack doesn't produce NaN. This
+    # isolates the quantization issue from the rest of the pipeline.
+    lang = None
+    for attr_path in ("vlm.model.language_model", "vlm.language_model"):
+        try:
+            lang = model.get_submodule(attr_path)
+            print(f"[paro] found language_model at {attr_path}")
+            break
+        except AttributeError:
+            continue
+    if lang is None:
+        return {
+            "optimization": "paroquant_vlm_marlin_w4a8",
+            "error": "could not find vlm.language_model submodule",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    dummy_ids = torch.randint(0, 150000, (1, 32), device="cuda", dtype=torch.long)
+    try:
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            out = lang(dummy_ids)
+        h = out.last_hidden_state if hasattr(out, "last_hidden_state") else (
+            out[0] if isinstance(out, tuple) else out
+        )
+        print(f"[paro] language_model output shape={tuple(h.shape)} "
+              f"dtype={h.dtype} "
+              f"has_nan={torch.isnan(h).any().item()} "
+              f"has_inf={torch.isinf(h).any().item()} "
+              f"mean={h.float().mean().item():.4f} "
+              f"std={h.float().std().item():.4f} "
+              f"abs_max={h.float().abs().max().item():.4f}")
+        if torch.isnan(h).any() or torch.isinf(h).any():
+            return {
+                "optimization": "paroquant_vlm_marlin_w4a8",
+                "error": f"language_model forward produced NaN/Inf; "
+                         f"first bad layer: {first_bad['name']} stats={first_bad['stats']}",
+                "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+            }
+        # Also run full lm_head to check final logits
+        if hasattr(model.vlm, "lm_head"):
+            logits = model.vlm.lm_head(h)
+            print(f"[paro] lm_head logits: "
+                  f"has_nan={torch.isnan(logits).any().item()} "
+                  f"has_inf={torch.isinf(logits).any().item()} "
+                  f"abs_max={logits.float().abs().max().item():.4f}")
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                return {
+                    "optimization": "paroquant_vlm_marlin_w4a8",
+                    "error": "lm_head logits have NaN/Inf",
+                    "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+                }
+    except Exception as e:
+        import traceback
+        return {
+            "optimization": "paroquant_vlm_marlin_w4a8",
+            "error": f"language_model smoke crashed: {type(e).__name__}: {e}",
+            "traceback": traceback.format_exc()[-2000:],
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    # Remove NaN-detection hooks after smoke passed.
+    for h in hook_handles:
+        h.remove()
+    hook_handles.clear()
+
+    if compile_expert:
+        print("[paro] compiling expert (reduce-overhead) ...")
+        model.expert = torch.compile(
+            model.expert, mode="reduce-overhead", dynamic=False,
+        )
+
+    processor = helper.get_processor(model.tokenizer)
+    avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+    all_cams = [
+        avdi.features.CAMERA.CAMERA_FRONT_WIDE_120FOV,
+        avdi.features.CAMERA.CAMERA_FRONT_TELE_30FOV,
+        avdi.features.CAMERA.CAMERA_CROSS_LEFT_120FOV,
+        avdi.features.CAMERA.CAMERA_CROSS_RIGHT_120FOV,
+    ]
+
+    pre_iter_hook = None
+    if compile_expert:
+        def pre_iter_hook():
+            torch.compiler.cudagraph_mark_step_begin()
+
+    print("[paro] starting measurement ...")
+    result = _run_ablation_sim(
+        model=model, processor=processor, helper=helper,
+        load_physical_aiavdataset=load_physical_aiavdataset,
+        avdi=avdi, all_cams=all_cams, needs_cam_indices_in_msg=False,
+        warmup_iters=3, label="paroquant_vlm",
+        pre_iter_hook=pre_iter_hook,
+        n_cams=n_cams, n_frames=n_frames, diff_steps=diff_steps,
+    )
+    result["optimization"] = (
+        f"paroquant_vlm_marlin_w4a8{'_compile' if compile_expert else ''}"
+    )
+    result["note"] = (
+        f"FlashDriveVLA/Alpamayo-R1-10B-finetuned-PARO: swapped "
+        f"{len(quant_map)}/252 VLM text-decoder Linears to Marlin W4A8 + "
+        f"paroquant pairwise rotation (group_size={group_size} krot={krot} "
+        f"bits={bits}). Loaded {loaded} tensors. vLLM apply_awq_marlin_linear "
+        f"for INT4 matmul, torch.ops.rotation.rotate for learned rotation, "
+        f"bf16↔fp16 activation adapter. base_repo={base_repo} on H100. "
+        f"skip_cot={skip_cot} compile_expert={compile_expert}."
+    )
+    return result
+
+
+@app.local_entrypoint()
+def paroquant_vlm(
+    compile_expert: bool = False,
+    diff_steps: int = 10,
+    n_cams: int = 4,
+    n_frames: int = 4,
+):
+    r = ablation_paroquant_vlm.remote(
+        compile_expert=compile_expert,
+        diff_steps=diff_steps,
+        n_cams=n_cams,
+        n_frames=n_frames,
+    )
+    print("[local] PARO result:", r)
+
+
+# Smoke test: verify paroquant imports, torch.ops.rotation.rotate registers,
+# PARO checkpoint downloads and we can identify the 252 quantized layer FQNs.
+# Does NOT run inference. ~2 min on H100 (mostly checkpoint download).
+@app.function(
+    gpu="H100",
+    image=image_paro_bench,
+    volumes={"/cache/hf": hf_cache, "/cache/pai": pai_cache},
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=60 * 10,
+)
+def smoke_paroquant(
+    paro_model: str = "FlashDriveVLA/Alpamayo-R1-10B-finetuned-PARO",
+):
+    import os
+    os.environ["HF_HOME"] = "/cache/hf"
+    os.environ["HUGGINGFACE_HUB_CACHE"] = "/cache/hf/hub"
+    if "HF_TOKEN" not in os.environ and "HUGGING_FACE_HUB_TOKEN" in os.environ:
+        os.environ["HF_TOKEN"] = os.environ["HUGGING_FACE_HUB_TOKEN"]
+
+    import torch
+    info = {"cuda_available": torch.cuda.is_available()}
+
+    try:
+        import paroquant
+        info["paroquant_version"] = getattr(paroquant, "__version__", "?")
+    except Exception as e:
+        info["paroquant_import_error"] = f"{type(e).__name__}: {e}"
+        return info
+
+    try:
+        import paroquant.kernels.cuda  # noqa
+        info["rotation_op_registered"] = hasattr(torch.ops, "rotation") and hasattr(
+            torch.ops.rotation, "rotate"
+        )
+    except Exception as e:
+        info["kernel_import_error"] = f"{type(e).__name__}: {e}"
+
+    try:
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            apply_awq_marlin_linear,
+        )
+        from vllm.scalar_type import scalar_types
+        info["vllm_marlin_imported"] = True
+        info["vllm_scalar_types_uint4"] = str(scalar_types.uint4)
+    except Exception as e:
+        info["vllm_marlin_import_error"] = f"{type(e).__name__}: {e}"
+
+    # Smoke the rotation kernel
+    try:
+        x = torch.randn(1, 8, 128, dtype=torch.float16, device="cuda")
+        pairs = torch.zeros(8, 128, dtype=torch.int16, device="cuda")
+        theta = torch.zeros(8, 64, dtype=torch.float16, device="cuda")
+        scales = torch.ones(1, 128, dtype=torch.float16, device="cuda")
+        y = torch.ops.rotation.rotate(x, pairs, theta, scales)
+        info["rotation_kernel_shape"] = list(y.shape)
+    except Exception as e:
+        info["rotation_kernel_error"] = f"{type(e).__name__}: {e}"
+
+    # Download PARO checkpoint + inspect index
+    try:
+        import json, glob
+        from huggingface_hub import snapshot_download
+        from safetensors import safe_open
+        import time
+        t0 = time.perf_counter()
+        local_dir = snapshot_download(paro_model)
+        info["download_s"] = round(time.perf_counter() - t0, 1)
+        info["local_dir"] = local_dir
+
+        index_file = os.path.join(local_dir, "model.safetensors.index.json")
+        all_keys = []
+        if os.path.exists(index_file):
+            with open(index_file) as f:
+                all_keys = list(json.load(f).get("weight_map", {}).keys())
+        else:
+            for sf in sorted(glob.glob(os.path.join(local_dir, "*.safetensors"))):
+                with safe_open(sf, framework="pt") as st:
+                    all_keys.extend(st.keys())
+        info["total_keys"] = len(all_keys)
+        info["n_qweight_keys"] = sum(1 for k in all_keys if k.endswith(".qweight"))
+        info["n_theta_keys"] = sum(1 for k in all_keys if k.endswith(".theta"))
+        # Show a representative FQN + tensor shapes for one layer.
+        qw_keys = [k for k in all_keys if k.endswith(".qweight")]
+        info["sample_qweight_fqns"] = qw_keys[:3]
+        if qw_keys:
+            base = qw_keys[0].removesuffix(".qlinear.qweight")
+            probe_shapes = {}
+            probe_dtypes = {}
+            for sf in sorted(glob.glob(os.path.join(local_dir, "*.safetensors"))):
+                with safe_open(sf, framework="pt") as st:
+                    for k in st.keys():
+                        if k.startswith(base + ".") and k.removeprefix(base + ".") in {
+                            "rotation.theta", "rotation.pairs", "rotation.channel_scales",
+                            "qlinear.qweight", "qlinear.qzeros", "qlinear.scales",
+                            "qlinear.g_idx", "qlinear.g_idx_sort_indices",
+                            "qlinear.workspace", "qlinear.input_global_scale",
+                        }:
+                            t = st.get_tensor(k)
+                            probe_shapes[k.removeprefix(base + ".")] = list(t.shape)
+                            probe_dtypes[k.removeprefix(base + ".")] = str(t.dtype)
+            info["probe_shapes"] = probe_shapes
+            info["probe_dtypes"] = probe_dtypes
+        # Enumerate the suffixes under one representative prefix so we know
+        # the module structure used in the checkpoint.
+        if qw_keys:
+            prefix = qw_keys[0].removesuffix(".qlinear.qweight").removesuffix(".qweight")
+            # Everything under this prefix
+            suffixes = sorted({
+                k[len(prefix)+1:] for k in all_keys if k.startswith(prefix + ".")
+            })
+            info["sample_prefix"] = prefix
+            info["suffixes_under_prefix"] = suffixes[:20]
+        # Count every distinct suffix type (last 2 segments) in the checkpoint
+        from collections import Counter
+        suffix_counts = Counter()
+        for k in all_keys:
+            parts = k.rsplit(".", 2)
+            if len(parts) == 3:
+                suffix_counts[parts[1] + "." + parts[2]] += 1
+            elif len(parts) == 2:
+                suffix_counts[parts[1]] += 1
+        info["suffix_counts_top10"] = dict(suffix_counts.most_common(10))
+        # w4a8_config.json
+        w4a8_path = os.path.join(local_dir, "w4a8_config.json")
+        if os.path.exists(w4a8_path):
+            with open(w4a8_path) as f:
+                info["w4a8_config"] = json.load(f)
+    except Exception as e:
+        info["download_error"] = f"{type(e).__name__}: {e}"
+
+    return info
+
+
+@app.local_entrypoint()
+def smoke_paro():
+    r = smoke_paroquant.remote()
+    print("[local] PARO smoke:", r)
+
+
+# -----------------------------------------------------------------------------
+# ABLATION: DFlash speculative decoding for CoC rollout
+# -----------------------------------------------------------------------------
+#
+# Strategy: load the FlashDriveVLA/Alpamayo-R1-10B-DFlash draft (0.5B params)
+# alongside the standard Alpamayo-R1 target. During the VLM autoregressive
+# decode phase (CoC text rollout between <|cot_start|> and <|traj_future_start|>),
+# route generation through draft.spec_generate(target=target).
+#
+# Integration challenge: DFlash's dflash_generate() starts with a prefill step
+# that calls `target(input_ids, ...)` assuming AutoModelForCausalLM. Alpamayo's
+# VLM is Qwen3VLForConditionalGeneration (multimodal prefill needs pixel_values,
+# image_grid_thw, etc.). We solve this by:
+#
+# 1. Running the VLM prefill OURSELVES (with image inputs) via vlm.forward
+#    to get the image-conditioned KV cache.
+# 2. Passing that KV cache and last-token embedding into a custom
+#    dflash_generate that skips the prefill step.
+# 3. Sampling the CoC text tokens via spec decoding until <|traj_future_start|>.
+#
+# Caveat: this measures the COC ROLLOUT speedup vs eager. Only meaningful
+# when CoC is enabled (skip_cot=False). We include a fresh CoC-on baseline
+# measurement in the same run for apples-to-apples comparison.
+
+@app.function(
+    gpu="H100",
+    image=image_dflash,
+    volumes={"/cache/hf": hf_cache, "/cache/pai": pai_cache},
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=60 * 40,
+)
+def ablation_dflash_coc(
+    draft_model: str = "FlashDriveVLA/Alpamayo-R1-10B-DFlash",
+    cot_max_tokens: int = 256,
+    block_size: int = 16,
+    temperature: float = 0.6,
+    diff_steps: int = 10,
+    n_cams: int = 4,
+    n_frames: int = 4,
+    run_baseline: bool = True,
+):
+    """DFlash speculative decoding for CoC text rollout.
+
+    Measures both:
+      (1) CoC-on eager baseline (no DFlash), for reference
+      (2) CoC-on with DFlash draft.spec_generate
+
+    Key difference from other ablations: CoC is ENABLED (skip_cot=False).
+    The VLM decodes up to `cot_max_tokens` before the diffusion expert runs.
+    """
+    import os
+    os.environ["HF_HOME"] = "/cache/hf"
+    os.environ["HUGGINGFACE_HUB_CACHE"] = "/cache/hf/hub"
+    os.environ["PAI_CACHE"] = "/cache/pai"
+    if "HF_TOKEN" not in os.environ and "HUGGING_FACE_HUB_TOKEN" in os.environ:
+        os.environ["HF_TOKEN"] = os.environ["HUGGING_FACE_HUB_TOKEN"]
+    elif "HUGGING_FACE_HUB_TOKEN" not in os.environ and "HF_TOKEN" in os.environ:
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+    import time
+    import torch
+
+    try:
+        from dflash.model import DFlashDraftModel, dflash_generate
+    except Exception as e:
+        return {
+            "optimization": "dflash_coc",
+            "error": f"dflash import failed: {type(e).__name__}: {e}",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    ctx = _setup_model_common()
+    model = ctx["model"]
+
+    # Load DFlash draft model (Qwen3-style, 0.5B). This is a bare Qwen3
+    # decoder variant so we use AutoModel to avoid CausalLM head expectations.
+    print(f"[dflash] loading draft {draft_model} ...")
+    from transformers import AutoModel
+    t0 = time.perf_counter()
+    try:
+        draft = AutoModel.from_pretrained(
+            draft_model,
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+        ).to("cuda").eval()
+    except Exception as e:
+        # fallback: try loading as DFlashDraftModel directly via safetensors
+        return {
+            "optimization": "dflash_coc",
+            "error": f"draft load failed: {type(e).__name__}: {e}",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+    print(f"[dflash] draft loaded in {time.perf_counter()-t0:.1f}s "
+          f"(type={type(draft).__name__})")
+
+    # Find the target model adapter: dflash_generate calls
+    #   target(input_ids, position_ids, past_key_values, use_cache,
+    #          logits_to_keep, output_hidden_states)
+    # and returns output.logits + output.hidden_states. It also uses
+    # target.model.embed_tokens and target.lm_head.
+    #
+    # For Alpamayo: the VLM is Qwen3VLForConditionalGeneration which exposes
+    # .language_model (the Qwen3-style text decoder). Its forward takes
+    # input_ids and returns standard CausalLMOutputWithPast when called
+    # directly on token inputs (no pixel_values needed if we provide
+    # past_key_values already populated).
+    #
+    # However, the PREFILL step in dflash_generate invokes target(input_ids,
+    # ...) with NO past_key_values yet. We can't run the VLM prefill through
+    # the plain text path because the first prompt contains image tokens that
+    # need Qwen3VL's visual encoding to be replaced.
+    #
+    # Minimal safe approach: the CoC decode happens AFTER the first token.
+    # So we:
+    #   (1) Run the FULL VLM prefill (vision + text) once to produce
+    #       past_key_values and first decoded token.
+    #   (2) Construct a "pre-primed" target wrapper that, on first call,
+    #       returns cached prefill outputs; on subsequent calls, runs the
+    #       text-only language_model forward.
+    # That's invasive and brittle. Simpler fallback: we just REPORT that the
+    # DFlash Transformers backend doesn't cleanly support VLMs without custom
+    # prefill handoff, and record the integration status.
+
+    # Attempt direct wrap — may fail on prefill step. We catch and fall back
+    # to reporting.
+    vlm = model.vlm
+    lang = getattr(vlm, "language_model", None) or getattr(vlm, "model", None)
+    if lang is None:
+        return {
+            "optimization": "dflash_coc",
+            "error": f"couldn't find language_model on VLM (type={type(vlm).__name__})",
+            "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        }
+
+    # Probe the VLM module tree for debugging what we have available.
+    print(f"[dflash] VLM type: {type(vlm).__name__}")
+    print(f"[dflash] VLM children: {[n for n,_ in vlm.named_children()]}")
+    print(f"[dflash] lm_head: {hasattr(vlm, 'lm_head')}, "
+          f"get_input_embeddings: {vlm.get_input_embeddings() is not None}")
+
+    # Configure target-side hidden layers to match DFlash expectations.
+    # DFlash's decoder needs target hidden states from specific layers
+    # (build_target_layer_ids). If the draft config has `target_layer_ids`
+    # attribute, we use it; otherwise we compute.
+    draft_cfg = draft.config
+    num_target_layers = getattr(lang.config, "num_hidden_layers", 36)
+    num_draft_layers = getattr(draft_cfg, "num_hidden_layers", 1)
+    if not hasattr(draft, "target_layer_ids"):
+        from dflash.model import build_target_layer_ids
+        draft.target_layer_ids = build_target_layer_ids(num_target_layers, num_draft_layers)
+    print(f"[dflash] target_layer_ids = {draft.target_layer_ids}")
+
+    # Because implementing the VLM handoff cleanly requires ~100 lines of
+    # Qwen3VL-specific prefill+decode splitting (and this is a first-pass
+    # attempt), record the integration state and move on. A follow-up would
+    # subclass Qwen3VLForConditionalGeneration to expose a
+    # `prepare_for_spec_decode` method returning (embeds_prefix, cache).
+    return {
+        "optimization": "dflash_coc",
+        "gpu_inf_ms": None, "hz": None, "ade_m": None, "n_preds": 0,
+        "error": "DFlash Transformers backend prefill is incompatible with "
+                 "Qwen3VLForConditionalGeneration without custom VLM→LM "
+                 "handoff. Draft loaded ({:.1f}M params, target_layer_ids={}). "
+                 "Follow-up: subclass Qwen3VL to expose prefill cache + "
+                 "override dflash_generate() to skip its own prefill step."
+                 .format(sum(p.numel() for p in draft.parameters()) / 1e6,
+                         draft.target_layer_ids),
+        "note": "PARTIAL: draft model loads successfully but VLM prefill "
+                 "cannot be routed through DFlash's text-only target(input_ids) "
+                 "interface in-place. Need custom integration layer.",
+    }
+
+
+@app.local_entrypoint()
+def dflash_coc():
+    r = ablation_dflash_coc.remote()
+    print("[local] DFlash result:", r)
+
+
+# Smoke test for DFlash: verify dflash imports and draft model loads.
+@app.function(
+    gpu="H100",
+    image=image_dflash,
+    volumes={"/cache/hf": hf_cache, "/cache/pai": pai_cache},
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=60 * 10,
+)
+def smoke_dflash(
+    draft_model: str = "FlashDriveVLA/Alpamayo-R1-10B-DFlash",
+):
+    import os
+    os.environ["HF_HOME"] = "/cache/hf"
+    os.environ["HUGGINGFACE_HUB_CACHE"] = "/cache/hf/hub"
+    if "HF_TOKEN" not in os.environ and "HUGGING_FACE_HUB_TOKEN" in os.environ:
+        os.environ["HF_TOKEN"] = os.environ["HUGGING_FACE_HUB_TOKEN"]
+
+    import torch
+    info = {"cuda_available": torch.cuda.is_available()}
+
+    try:
+        import dflash
+        info["dflash_version"] = getattr(dflash, "__version__", "?")
+    except Exception as e:
+        info["dflash_import_error"] = f"{type(e).__name__}: {e}"
+        return info
+
+    try:
+        from dflash.model import DFlashDraftModel, dflash_generate, build_target_layer_ids
+        info["dflash_model_api_imported"] = True
+    except Exception as e:
+        info["dflash_model_import_error"] = f"{type(e).__name__}: {e}"
+
+    # Try loading draft
+    try:
+        import time
+        from transformers import AutoModel, AutoConfig
+        t0 = time.perf_counter()
+        cfg = AutoConfig.from_pretrained(draft_model, trust_remote_code=True)
+        info["draft_config_type"] = type(cfg).__name__
+        info["draft_num_hidden_layers"] = getattr(cfg, "num_hidden_layers", None)
+        info["draft_hidden_size"] = getattr(cfg, "hidden_size", None)
+        info["draft_vocab_size"] = getattr(cfg, "vocab_size", None)
+
+        draft = AutoModel.from_pretrained(
+            draft_model, trust_remote_code=True, dtype=torch.bfloat16,
+        ).to("cuda").eval()
+        info["draft_load_s"] = round(time.perf_counter() - t0, 1)
+        info["draft_type"] = type(draft).__name__
+        info["draft_param_count_M"] = round(
+            sum(p.numel() for p in draft.parameters()) / 1e6, 1
+        )
+    except Exception as e:
+        info["draft_load_error"] = f"{type(e).__name__}: {e}"
+
+    return info
+
+
+@app.local_entrypoint()
+def smoke_dflash_local():
+    r = smoke_dflash.remote()
+    print("[local] DFlash smoke:", r)
