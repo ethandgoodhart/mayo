@@ -2972,7 +2972,10 @@ def ablation_paroquant_vlm(
             apply_awq_marlin_linear,
             marlin_make_workspace,
             marlin_make_empty_g_idx,
+            marlin_permute_scales,
+            awq_to_marlin_zero_points,
         )
+        from vllm import _custom_ops as vllm_ops
         from vllm.scalar_type import scalar_types
         MARLIN_QUANT_TYPE = scalar_types.uint4
     except Exception as e:
@@ -3243,27 +3246,68 @@ def ablation_paroquant_vlm(
           f"(expected ~{len(quant_map) * expected_per_layer})")
 
     # Regenerate GPU-specific Marlin workspace/g_idx/g_idx_sort_indices for each
-    # layer. The checkpoint's stored values were sized for whatever GPU did the
-    # conversion (different SM count or sort perm than our H100). Using those
-    # stale tensors is a silent corruption source — workspace is scratch, g_idx
-    # is the act_order permutation (empty when act_order=False, as here).
+    # layer + run AWQ→Marlin conversion on scales/qzeros IF they look raw-AWQ.
+    #
+    # The checkpoint's qweight is already in Marlin-repacked shape
+    # (in/16, out*2), confirming the conversion happened at save time. But
+    # smoke tests show stacked forward NaNs — likely root cause is that
+    # scales/qzeros values were NOT permuted at save time (same shape as AWQ
+    # raw, which coincidentally matches Marlin shape). We run the permutations
+    # here to match what vllm's AWQMarlinLinearMethod.process_weights_after_loading
+    # does.
     device = torch.device("cuda")
+    bits = 4
     regenerated = 0
+    permuted_scales = 0
+    permuted_qzeros = 0
     for fqn in quant_map:
         parent_name, attr = (
             fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
         )
         parent = model.get_submodule(parent_name) if parent_name else model
         mod = getattr(parent, attr)
+        k = mod.in_features
+        n = mod.out_features
+
         mod.register_buffer("workspace",
-            marlin_make_workspace(mod.out_features, device))
+            marlin_make_workspace(n, device))
         mod.register_buffer("g_idx",
             marlin_make_empty_g_idx(device).data)
         mod.register_buffer("g_idx_sort_indices",
             marlin_make_empty_g_idx(device).data)
         regenerated += 1
-    print(f"[paro] regenerated GPU-specific workspace/g_idx for "
-          f"{regenerated} layers")
+
+        # Permute scales from AWQ → Marlin layout.
+        try:
+            permuted = marlin_permute_scales(
+                mod.scales.data, size_k=k, size_n=n,
+                group_size=group_size,
+            )
+            mod.scales.data.copy_(permuted)
+            permuted_scales += 1
+        except Exception as e:
+            if permuted_scales == 0:
+                print(f"[paro] marlin_permute_scales failed on {fqn}: {e}")
+
+        # Permute qzeros from AWQ → Marlin layout. size_k for zero_points is
+        # num_groups (not input_size_per_partition — see vllm AWQMarlin code).
+        try:
+            num_groups = k // group_size
+            permuted_zp = awq_to_marlin_zero_points(
+                mod.qzeros.data, size_k=num_groups, size_n=n,
+                num_bits=bits,
+            )
+            if permuted_zp.shape == mod.qzeros.data.shape:
+                mod.qzeros.data.copy_(permuted_zp)
+            else:
+                mod.register_buffer("qzeros", permuted_zp)
+            permuted_qzeros += 1
+        except Exception as e:
+            if permuted_qzeros == 0:
+                print(f"[paro] awq_to_marlin_zero_points failed on {fqn}: {e}")
+
+    print(f"[paro] regenerated workspace/g_idx for {regenerated} layers; "
+          f"permuted scales on {permuted_scales}, qzeros on {permuted_qzeros}")
 
     expected_total = len(quant_map) * expected_per_layer
     if loaded < expected_total * 0.9:
