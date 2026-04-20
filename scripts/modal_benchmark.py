@@ -1392,7 +1392,7 @@ def _run_ablation_sim(model, processor, helper, load_physical_aiavdataset,
                      avdi, all_cams, needs_cam_indices_in_msg,
                      warmup_iters=3, label="ablation", pre_iter_hook=None,
                      n_cams=None, n_frames=None, diff_steps=None,
-                     duration_s=None):
+                     duration_s=None, skip_cot=True, cot_max_tokens=256):
     """Run baseline-methodology sim loop for one ablation.
 
     Assumes caller has already applied the optimization to `model`. Loads data
@@ -1420,10 +1420,11 @@ def _run_ablation_sim(model, processor, helper, load_physical_aiavdataset,
             )
         else:
             msgs = helper.create_message(frames)
-        # Skip CoC: end prompt at <|traj_future_start|> so no CoC decode.
-        msgs[-1]["content"][0]["text"] = (
-            "<|cot_start|><|cot_end|><|traj_future_start|>"
-        )
+        if skip_cot:
+            # End prompt at <|traj_future_start|> so no CoC decode.
+            msgs[-1]["content"][0]["text"] = (
+                "<|cot_start|><|cot_end|><|traj_future_start|>"
+            )
         return msgs
 
     def _run_one(t_us):
@@ -1459,7 +1460,7 @@ def _run_ablation_sim(model, processor, helper, load_physical_aiavdataset,
                 data=model_inputs,
                 top_p=0.98, temperature=0.6,
                 num_traj_samples=1,
-                max_generation_length=1,
+                max_generation_length=(1 if skip_cot else cot_max_tokens),
                 return_extra=True,
                 diffusion_kwargs={"inference_step": _diff_steps},
             )
@@ -3854,3 +3855,73 @@ def smoke_dflash(
 def smoke_dflash_local():
     r = smoke_dflash.remote()
     print("[local] DFlash smoke:", r)
+
+
+# -----------------------------------------------------------------------------
+# CoC-ON H100 baseline
+# -----------------------------------------------------------------------------
+# Apples-to-apples reference for any future DFlash integration. CoC is the
+# autoregressive Chain-of-Causation text rollout the VLM decodes between
+# <|cot_start|> and <|traj_future_start|>. Every other ablation in results.csv
+# runs skip_cot=True (decodes 1 token) — so this is the ONLY row where the VLM
+# autoregressive decode path is exercised.
+#
+# Config: 4cam / 4fr / 10diff (same as existing baseline row). Expected: ~900ms
+# (baseline 405.4ms + ~500ms CoC decode overhead per README notes). DFlash's
+# speedup target is the CoC portion; measure here, measure DFlash later, take
+# ratio on same H100.
+
+@app.function(
+    gpu="H100",
+    image=image_fp8,
+    volumes={"/cache/hf": hf_cache, "/cache/pai": pai_cache},
+    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=60 * 30,
+)
+def ablation_coc_on_baseline(
+    cot_max_tokens: int = 256,
+    diff_steps: int = 10,
+    n_cams: int = 4,
+    n_frames: int = 4,
+    duration_s: float = 18.0,
+):
+    """CoC-ON H100 baseline: identical to existing 4cam_4fr_10diff row but
+    with skip_cot=False so the VLM runs the full CoC autoregressive decode.
+    """
+    ctx = _setup_model_common()
+    result = _run_ablation_sim(
+        model=ctx["model"], processor=ctx["processor"], helper=ctx["helper"],
+        load_physical_aiavdataset=ctx["load_physical_aiavdataset"],
+        avdi=ctx["avdi"], all_cams=ctx["all_cams"],
+        needs_cam_indices_in_msg=ctx["needs_cam_indices_in_msg"],
+        warmup_iters=2, label="coc_on_baseline",
+        n_cams=n_cams, n_frames=n_frames, diff_steps=diff_steps,
+        duration_s=duration_s, skip_cot=False, cot_max_tokens=cot_max_tokens,
+    )
+    result["optimization"] = "coc_on_baseline"
+    result["note"] = (
+        f"Baseline with CoC ENABLED (skip_cot=False, max_gen={cot_max_tokens}). "
+        f"H100 / nvidia/Alpamayo-R1-10B / bf16 / flash_attn_2 / SDPA expert / "
+        f"no compile. Reference for DFlash speculative-decode comparison — the "
+        f"CoC decode is the only autoregressive text path in the pipeline, "
+        f"and is where DFlash's 2-6x speedup applies."
+    )
+    return result
+
+
+@app.local_entrypoint()
+def coc_on_baseline(
+    cot_max_tokens: int = 256,
+    diff_steps: int = 10,
+    n_cams: int = 4,
+    n_frames: int = 4,
+    duration_s: float = 18.0,
+):
+    r = ablation_coc_on_baseline.remote(
+        cot_max_tokens=cot_max_tokens,
+        diff_steps=diff_steps,
+        n_cams=n_cams,
+        n_frames=n_frames,
+        duration_s=duration_s,
+    )
+    print("[local] CoC-on baseline result:", r)
