@@ -146,7 +146,7 @@ def compose_panels(cam_panel_bgr, bev_bgr):
     return np.concatenate([cam_panel_bgr, bev_bgr], axis=1)
 
 
-async def run(ws_url, cam_index, target_fps):
+async def run(ws_url, cam_index, target_fps, replicas):
     cap = cv2.VideoCapture(cam_index)
     if not cap.isOpened():
         raise RuntimeError(f"cv2 cannot open camera {cam_index}")
@@ -196,12 +196,36 @@ async def run(ws_url, cam_index, target_fps):
     else:
         raise RuntimeError("container never became ready")
 
-    print(f"[client] connecting WebSocket {ws_url} ...")
-    async with websockets.connect(ws_url, max_size=8 * 1024 * 1024,
-                                  ping_interval=20, ping_timeout=60,
-                                  open_timeout=120) as ws:
-        print("[client] connected; waiting for hello ...")
+    print(f"[client] opening {replicas} WebSocket connection(s) to {ws_url} ...")
+    ws_list = []
+    # Pre-warm multiple containers in parallel by firing extra HTTP GETs that
+    # Modal's @concurrent(max_inputs=1) will route to distinct replicas.
+    async def _prewarm():
+        def _get():
+            try:
+                urllib.request.urlopen(http_url, timeout=600).read(1)
+            except Exception:
+                pass
+        await asyncio.gather(*[
+            asyncio.get_event_loop().run_in_executor(None, _get)
+            for _ in range(replicas)
+        ])
+    await _prewarm()
+    for i in range(replicas):
+        w = await websockets.connect(
+            ws_url, max_size=8 * 1024 * 1024,
+            ping_interval=20, ping_timeout=60, open_timeout=120,
+        )
+        ws_list.append(w)
+        print(f"[client]   ws #{i} connected")
+        # Give Modal's scheduler time to commit this connection to one container
+        # before the next connect lands (otherwise both can land on the only
+        # fully-warm container).
+        if i < replicas - 1:
+            await asyncio.sleep(3)
+    print(f"[client] all {replicas} connections up; waiting for hello ...")
 
+    try:
         async def capture():
             """Pull frames from the webcam as fast as possible, store latest."""
             loop = asyncio.get_event_loop()
@@ -215,6 +239,7 @@ async def run(ws_url, cam_index, target_fps):
 
         async def sender():
             next_send = time.perf_counter()
+            idx = 0
             while not state["stop"]:
                 now = time.perf_counter()
                 if now < next_send:
@@ -230,14 +255,18 @@ async def run(ws_url, cam_index, target_fps):
                 else:
                     frame_send = frame
                 jpeg = encode_jpeg(frame_send, quality=80)
+                # Round-robin across replicas so each server keeps its own 4-frame
+                # temporal buffer + each GPU does half the work.
+                target = ws_list[idx % replicas]
+                idx += 1
                 try:
-                    await ws.send(msgpack.packb({"jpegs": [jpeg, jpeg, jpeg, jpeg]}))
+                    await target.send(msgpack.packb({"jpegs": [jpeg, jpeg, jpeg, jpeg]}))
                     state["send_count"] += 1
                 except websockets.ConnectionClosed:
                     state["stop"] = True
                     return
 
-        async def receiver():
+        async def receiver(ws, replica_idx):
             while not state["stop"]:
                 try:
                     raw = await ws.recv()
@@ -247,10 +276,10 @@ async def run(ws_url, cam_index, target_fps):
                 msg = msgpack.unpackb(raw, raw=False)
                 if msg.get("hello"):
                     state["server_hw"] = (int(msg["H"]), int(msg["W"]))
-                    print(f"[client] server target resolution: {msg['W']}x{msg['H']}")
+                    print(f"[client] ws#{replica_idx} target resolution: {msg['W']}x{msg['H']}")
                     continue
                 if msg.get("warming"):
-                    state["warming"] = True
+                    # Wait for ALL replicas to have filled their temporal buffers.
                     continue
                 state["warming"] = False
                 shape = tuple(msg["pred_shape"])
@@ -355,12 +384,17 @@ async def run(ws_url, cam_index, target_fps):
                 elapsed = time.perf_counter() - t_iter
                 await asyncio.sleep(max(0.001, target_interval - elapsed))
 
-        await asyncio.gather(capture(), sender(), receiver(), display(),
-                             bev_renderer(), logger())
-        try:
-            await ws.send(msgpack.packb({"bye": True}))
-        except Exception:
-            pass
+        tasks = [capture(), sender(), display(), bev_renderer(), logger()]
+        for i, w in enumerate(ws_list):
+            tasks.append(receiver(w, i))
+        await asyncio.gather(*tasks)
+    finally:
+        for w in ws_list:
+            try:
+                await w.send(msgpack.packb({"bye": True}))
+                await w.close()
+            except Exception:
+                pass
 
     cap.release()
     cv2.destroyAllWindows()
@@ -370,11 +404,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ws_url", help="wss://...modal.run/ws")
     ap.add_argument("--cam", type=int, default=0, help="cv2 camera index")
-    ap.add_argument("--fps", type=float, default=6.0,
-                    help="target send rate (server tops out near ~5Hz on B200)")
+    ap.add_argument("--fps", type=float, default=12.0,
+                    help="target send rate (with --replicas=2, ~12Hz = 6Hz per replica)")
+    ap.add_argument("--replicas", type=int, default=2,
+                    help="number of parallel server replicas to distribute frames across")
     args = ap.parse_args()
     try:
-        asyncio.run(run(args.ws_url, args.cam, args.fps))
+        asyncio.run(run(args.ws_url, args.cam, args.fps, args.replicas))
     except KeyboardInterrupt:
         print("\n[client] stopped")
 

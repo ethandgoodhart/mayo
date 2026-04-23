@@ -75,9 +75,10 @@ pai_cache = modal.Volume.from_name("alpamayo-pai-cache", create_if_missing=True)
     secrets=[modal.Secret.from_name("huggingface")],
     timeout=60 * 60,
     scaledown_window=600,
-    max_containers=1,
+    min_containers=2,
+    max_containers=2,
 )
-@modal.concurrent(max_inputs=4)
+@modal.concurrent(max_inputs=1)  # 1 WS connection per container; forces 2 conns onto 2 boxes
 class LiveInference:
 
     @modal.enter()
