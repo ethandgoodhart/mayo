@@ -48,9 +48,12 @@ CAM_LAYOUT = [  # (row, col, name) — 2x2 dashcam-style grid on left half
 ]
 
 
-def render_bev_panel(pred_xy, label, hz_so_far, pred_age_s):
-    """Render just the BEV (matplotlib), returns BGR numpy. Expensive (~50-80ms),
-    so we cache this and only re-render when a new prediction arrives."""
+TITLE_STRIP_H = 38  # pixel rows reserved at top of BEV for cv2-overlaid title
+
+
+def render_bev_panel(pred_xy):
+    """Render just the BEV (matplotlib) with NO title — the title is drawn live
+    via cv2 at 60 fps over a cached copy of this image. Returns BGR numpy."""
     fig = plt.figure(figsize=(7, 6), dpi=110)
     ax_bev = fig.add_subplot(1, 1, 1)
     if pred_xy is not None and len(pred_xy) >= 2:
@@ -66,26 +69,81 @@ def render_bev_panel(pred_xy, label, hz_so_far, pred_age_s):
         ax_bev.set_xlim(cy - span / 2 - pad, cy + span / 2 + pad)
         ax_bev.set_ylim(cx - span / 2 - pad, cx + span / 2 + pad)
         ax_bev.legend(loc="lower right", fontsize=9)
-        ax_bev.set_title(
-            f"{label}  |  {hz_so_far:.2f} Hz  |  {pred_age_s*1000:.0f}ms stale",
-            fontsize=11,
-        )
     else:
         ax_bev.scatter([0], [0], c="k", s=60, marker="^")
         ax_bev.set_xlim(-10, 10)
         ax_bev.set_ylim(-5, 15)
-        ax_bev.set_title(f"{label}  |  awaiting first prediction ...", fontsize=11)
     ax_bev.set_aspect("equal")
     ax_bev.grid(True, alpha=0.3)
     ax_bev.set_xlabel("y (left+, m)")
     ax_bev.set_ylabel("x (forward+, m)")
-    fig.tight_layout()
+    # Leave vertical space at the top for cv2 to draw the live title.
+    fig.subplots_adjust(top=0.92, bottom=0.10, left=0.10, right=0.97)
     fig.canvas.draw()
     rgba = np.asarray(fig.canvas.buffer_rgba())
     rgb = rgba[..., :3]
     bgr = rgb[..., ::-1].copy()
     plt.close(fig)
+    # Blank out top strip so cv2 overlay sits on clean white.
+    bgr[:TITLE_STRIP_H] = 255
     return bgr
+
+
+def overlay_title(bev_bgr, label, hz, stale_s, warming):
+    """Draw live title over the reserved top strip of a cached BEV."""
+    out = bev_bgr  # mutate in place; caller already owns a ref
+    if warming:
+        text = f"{label}  |  awaiting first prediction ..."
+    else:
+        text = f"{label}  |  {hz:.2f} Hz  |  {stale_s*1000:.0f}ms stale"
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+    x = max(10, (out.shape[1] - tw) // 2)
+    out[:TITLE_STRIP_H] = 255
+    cv2.putText(out, text, (x, TITLE_STRIP_H - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+    return out
+
+
+def render_cam_panel(frame_bgr, sim_t, panel_h=660):
+    """Fast cv2-native 2x2 dashcam grid from one BGR frame (duplicated 4x).
+    Returns BGR image. Runs at camera fps (no matplotlib)."""
+    suptitle_h = 30     # top strip for sim_t
+    row_label_h = 20    # per-tile label strip
+    row_gap = 10
+    col_gap = 10
+    side_pad = 10
+    usable_h = panel_h - suptitle_h - 2 * row_label_h - row_gap
+    tile_h = usable_h // 2
+    h, w = frame_bgr.shape[:2]
+    tile_w = int(w * tile_h / h)
+    panel_w = 2 * tile_w + col_gap + 2 * side_pad
+    canvas = np.full((panel_h, panel_w, 3), 255, dtype=np.uint8)
+    cv2.putText(canvas, f"sim_t={sim_t:.2f}s",
+                (panel_w // 2 - 70, suptitle_h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+    tile = cv2.resize(frame_bgr, (tile_w, tile_h))
+    for r, c, name in CAM_LAYOUT:
+        x0 = side_pad + c * (tile_w + col_gap)
+        y0 = suptitle_h + r * (tile_h + row_label_h + row_gap)
+        cv2.putText(canvas, name.replace("_", " "),
+                    (x0 + 4, y0 + row_label_h - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        canvas[y0 + row_label_h:y0 + row_label_h + tile_h, x0:x0 + tile_w] = tile
+    return canvas
+
+
+def compose_panels(cam_panel_bgr, bev_bgr):
+    ch, cw = cam_panel_bgr.shape[:2]
+    bh, bw = bev_bgr.shape[:2]
+    target_h = max(ch, bh)
+    if ch != target_h:
+        scale = target_h / ch
+        cam_panel_bgr = cv2.resize(cam_panel_bgr,
+                                   (int(cw * scale), target_h))
+    if bh != target_h:
+        scale = target_h / bh
+        bev_bgr = cv2.resize(bev_bgr, (int(bw * scale), target_h))
+    return np.concatenate([cam_panel_bgr, bev_bgr], axis=1)
 
 
 async def run(ws_url, cam_index, target_fps):
@@ -144,6 +202,17 @@ async def run(ws_url, cam_index, target_fps):
                                   open_timeout=120) as ws:
         print("[client] connected; waiting for hello ...")
 
+        async def capture():
+            """Pull frames from the webcam as fast as possible, store latest."""
+            loop = asyncio.get_event_loop()
+            while not state["stop"]:
+                ok, frame = await loop.run_in_executor(None, cap.read)
+                if not ok:
+                    await asyncio.sleep(0.005)
+                    continue
+                state["latest_raw"] = frame
+                await asyncio.sleep(0)  # yield
+
         async def sender():
             next_send = time.perf_counter()
             while not state["stop"]:
@@ -151,25 +220,22 @@ async def run(ws_url, cam_index, target_fps):
                 if now < next_send:
                     await asyncio.sleep(next_send - now)
                 next_send = now + min_frame_interval
-                ok, frame = cap.read()
-                if not ok:
-                    await asyncio.sleep(0.01)
+                frame = state.get("latest_raw")
+                if frame is None:
+                    await asyncio.sleep(0.005)
                     continue
-                # Resize to server-target size if known, else send original.
                 if state["server_hw"] is not None:
                     H, W = state["server_hw"]
                     frame_send = cv2.resize(frame, (W, H))
                 else:
                     frame_send = frame
                 jpeg = encode_jpeg(frame_send, quality=80)
-                # Simulate 4-camera car: duplicate webcam into all 4 cam slots.
                 try:
                     await ws.send(msgpack.packb({"jpegs": [jpeg, jpeg, jpeg, jpeg]}))
                     state["send_count"] += 1
                 except websockets.ConnectionClosed:
                     state["stop"] = True
                     return
-                state["latest_raw"] = frame  # for local display
 
         async def receiver():
             while not state["stop"]:
@@ -232,34 +298,65 @@ async def run(ws_url, cam_index, target_fps):
                       f"rtt={state['total_ms']:6.1f}ms  n_sent={state['send_count']} "
                       f"n_recv={state['recv_count']}  [{status}]", flush=True)
 
+        bev_state = {
+            "bgr": None,           # last rendered BEV panel
+            "rendering": False,    # in-flight render?
+            "last_pred_id": -1,    # recv_count of the pred used
+        }
+        label = "4cam_4fr_10diff"
+
+        async def bev_renderer():
+            """Re-render the BEV in a worker thread only when a new prediction
+            arrives. Caches the rendered BGR; display loop blits it at 60 fps."""
+            loop = asyncio.get_event_loop()
+            while not state["stop"]:
+                await asyncio.sleep(0.01)
+                rid = state["recv_count"]
+                if rid == bev_state["last_pred_id"]:
+                    continue
+                if bev_state["rendering"]:
+                    continue
+                bev_state["rendering"] = True
+                pred = state["latest_pred"]
+                bev = await loop.run_in_executor(None, render_bev_panel, pred)
+                bev_state["bgr"] = bev
+                bev_state["last_pred_id"] = rid
+                bev_state["rendering"] = False
+
         async def display():
             window = "Alpamayo live demo  (ESC to quit)"
             cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(window, 1540, 660)
-            label = "4cam_4fr_10diff"
+            cv2.resizeWindow(window, 1540, 720)
+            placeholder = np.full((660, 770, 3), 240, dtype=np.uint8)
+            cv2.putText(placeholder, "awaiting first prediction ...",
+                        (40, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+            target_interval = 1.0 / 60
             while not state["stop"]:
-                await asyncio.sleep(1.0 / 10)  # matplotlib render ~50-100ms; 10fps plenty
+                t_iter = time.perf_counter()
                 frame_bgr = state.get("latest_raw")
-                if frame_bgr is None:
-                    continue
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                # Simulate 4-camera car: duplicate the webcam into each slot.
-                cam_rgbs = {name: frame_rgb for _, _, name in CAM_LAYOUT}
-                now = time.perf_counter()
-                sim_t = now - state["start_t"]
-                pred_age_s = (now - state["latest_pred_t"]) if state["latest_pred_t"] else 0.0
-                loop = asyncio.get_event_loop()
-                bgr = await loop.run_in_executor(
-                    None, render_composite,
-                    cam_rgbs, state["latest_pred"], label, sim_t, pred_age_s, state["hz"],
-                )
-                cv2.imshow(window, bgr)
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:
-                    state["stop"] = True
-                    break
+                if frame_bgr is not None:
+                    sim_t = t_iter - state["start_t"]
+                    cam_panel = render_cam_panel(frame_bgr, sim_t, panel_h=660)
+                    bev = bev_state["bgr"]
+                    if bev is None:
+                        bev = placeholder.copy()
+                    else:
+                        bev = bev.copy()  # don't mutate the cache
+                    # Show the 10s average stale (same window as Hz) so the
+                    # number is readable instead of flashing 0->300 every frame.
+                    stale_s = state["avg_stale_ms_10s"] / 1000.0
+                    overlay_title(bev, label, state["hz"], stale_s, state["warming"])
+                    combo = compose_panels(cam_panel, bev)
+                    cv2.imshow(window, combo)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27:
+                        state["stop"] = True
+                        break
+                elapsed = time.perf_counter() - t_iter
+                await asyncio.sleep(max(0.001, target_interval - elapsed))
 
-        await asyncio.gather(sender(), receiver(), display(), logger())
+        await asyncio.gather(capture(), sender(), receiver(), display(),
+                             bev_renderer(), logger())
         try:
             await ws.send(msgpack.packb({"bye": True}))
         except Exception:
