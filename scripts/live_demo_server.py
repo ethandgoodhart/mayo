@@ -70,13 +70,13 @@ pai_cache = modal.Volume.from_name("alpamayo-pai-cache", create_if_missing=True)
 
 
 @app.cls(
-    gpu="B200",
+    gpu="H100",
     volumes={"/cache/hf": hf_cache, "/cache/pai": pai_cache},
     secrets=[modal.Secret.from_name("huggingface")],
     timeout=60 * 60,
     scaledown_window=600,
-    min_containers=2,
-    max_containers=2,
+    min_containers=1,
+    max_containers=1,
 )
 @modal.concurrent(max_inputs=1)  # 1 WS connection per container; forces 2 conns onto 2 boxes
 class LiveInference:

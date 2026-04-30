@@ -360,6 +360,9 @@ async def run(ws_url, cam_index, target_fps, replicas):
             cv2.putText(placeholder, "awaiting first prediction ...",
                         (40, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
             target_interval = 1.0 / 60
+            boot_msg = np.full((660, 1540, 3), 240, dtype=np.uint8)
+            cv2.putText(boot_msg, "waiting for webcam frames ...",
+                        (40, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
             while not state["stop"]:
                 t_iter = time.perf_counter()
                 frame_bgr = state.get("latest_raw")
@@ -377,10 +380,12 @@ async def run(ws_url, cam_index, target_fps, replicas):
                     overlay_title(bev, label, state["hz"], stale_s, state["warming"])
                     combo = compose_panels(cam_panel, bev)
                     cv2.imshow(window, combo)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == 27:
-                        state["stop"] = True
-                        break
+                else:
+                    cv2.imshow(window, boot_msg)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
+                    state["stop"] = True
+                    break
                 elapsed = time.perf_counter() - t_iter
                 await asyncio.sleep(max(0.001, target_interval - elapsed))
 
